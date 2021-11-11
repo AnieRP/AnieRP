@@ -1,0 +1,394 @@
+#####Super code pour le model écologique réaliser dans le cadre du projet d'aménagement dans la pinède du camping du parc d'Oka GDF8402 ########
+
+####****Information importante****####
+####*
+####*La base de donnee doit contenir les informations suivante, dans cet ordre
+####*   ID /	DHP /	DHP_Mort /	ETAT /	X /	Y /	SP
+####*   
+####*   Ce code a pour objectif de modeliser la croissance d'une foret spatialement explicite generer a partir de donnees terrain et lidar
+####*   Il utilise la competition comme variable determinant la croissance des arbres
+####*   
+####*   Il est possible de changer de site en utilisant ctrl-f et l'option remplacer dans R studio
+####*   
+####*   Ce code a ete ecrit par Maryse Proulx et Anie Rivard Pare avec l'assistance de Valerie Brazeau, Pascal P. Rochon et Philippe Nolet
+
+
+##Installer les packages, une fois ça fait une fois il faut les commenter pour ne pas les réinstaller chaque fois
+#install.packages("readxl")
+#install.packages("spatstat")
+#install.packages("plyr")
+#install.packages("siplab")
+
+
+#On commence par effacer lenvironnement R parce que sinon tout va planter. au besoin le refaire si le code renvoie des erreur, ca arrive
+rm (list = ls ())
+
+##Pour charger les library qui nous intéreste, ça on peut le faire à chaque fois, ça ne ralenti pas trop le modèle
+library(readxl)
+library(spatstat)
+library (siplab)
+library(plyr)
+library(readr)
+
+
+##Maintenant il faut importer les donnees. ***Avant le chargement, verifier toute erreur dans les donnees : 
+##absence de ID, erreur dans les colonnes etc.***
+setwd("C:/Users/ataya/Desktop/MGDEF/GDF7303/data/anse")
+ANSE_SQ<-read_csv("Arbres_anse_ECON7.csv") #il va falloir specifier le scenario apres
+#View(ANSE_SQ)
+
+#Assurer le format des donnees
+class(ANSE_SQ$Y) # le repeter pour X
+ANSE_SQ$Y<- as.numeric(ANSE_SQ$Y) # si les coordonnees ne sont pas numÃ©riques, utiliser la formule suivant pour les convertir
+class(ANSE_SQ$ETAT)
+
+#Loader les proportions, elles vont servir plus tard à piger au hasard les sp pour la regeneration
+Prop_sp_anse<- read.csv("regenanse.csv")
+
+
+#Toujours une bonne habitude de valider que les donnees ont ete importees correctement
+#View(Prop_sp_anse)
+
+#Il faut aussi charger les limites des routes et des campings qui seront exclus pour ajouter la regeneration partout 
+#(sauf sur les plantations et sur le camping)
+
+#charger les zones sans regeneration. Ce sont des fichiers excels avec des colonnes de coordonnÃ©es des coins de la zone
+#Attention, les points de ces fichier doivent etre dans *** l ORDRE *** dans le sens des 
+
+
+Routes_C<- read.csv("Anse_T1_MAJ.csv") 
+Routes_C_2<-read.csv("Anse_T2_MAJ.csv") # Il y a deux trous dans Anse
+
+
+##Avant d'entre dans une loop il faut setter des prérequis
+
+#set.seed(1) #Pour la duré de la construction du code. Commenter lorsqu'on est satisfait du modèle, 
+#il est possible de l'utilise aussi quand on test le model pour comprendre plus facilement comment il reagit
+
+#Remplace le 1 par le temps de l'ordinateur à la miliseconde pret
+#set.seed(time)
+
+gaule_ha<-800 #je met ca ici pour que ce soit plus facile de le changer sans toucher a la fonction et eventuellement 
+#creer une fonction qui genere la table de probabilite automatiquement avec le bon nombre de tirage
+
+
+#Il faut générer le premier groupe de regeneration, qui restera le meme tout au long de la simulation. ***il pourrait etre interessant de 
+#refaire cette etape apres 50 ans juste pour changer la regeneration de place
+
+#dabord, convertir les colonnes en vecteurs
+
+XRoutes_C<-as.vector(Routes_C$X) # le repeter pour chaque coordonnee de chaque trou (X,Y)
+YRoutes_C<-as.vector(Routes_C$Y)
+YRoutes_C_2<-as.vector(Routes_C_2$Y)
+XRoutes_C_2<-as.vector(Routes_C_2$X)
+
+
+#Il faut maintenant definir un vecteur pour trouver aleatoirement les especes. 
+#Il faudra faire attention a attribuer un dhp de 0 et une croissance de 0 a tout ce qui sortira "Aucun" 
+#qui represente les problemes de regeneration. 
+
+tirage=function(n,Prop_sp_anse){
+  sample(x=Prop_sp_anse, size=n, replace=FALSE)   
+}
+sp_aleatoire<-as.vector(tirage(gaule_ha,Prop_sp_anse[,1]))
+
+#Definir les marques de la regeneration, en faisant bien attention d'avoir les memes titres de colonnes ici on est en dataframe et non en ppp!
+
+M_regen<-data.frame(ID0=1:gaule_ha, DHP=1, DHP_mort=0,Temps="", SP=sp_aleatoire, ETAT="V",cindex="", CR="",seuil_mortalite="",seuil_coupe="")
+M_regen$ID<- paste("R", M_regen$ID0, sep="")
+M_regen$ID0 = NULL
+
+#Comme on est en dataframe et qu'on ne veux pas les points ou la regeneration est abscente, 
+#mais trouvé une façon plus courte en fait, on va quand meme le faire pour la statistique qu'on peu en sortir plus facilement
+####a enlever seulement si le code devient trop lourd, mais c est en dehors de la loop alors devrais etre ok
+M_regen2<-subset(M_regen,M_regen$SP!="Aucun",select = c(DHP,DHP_mort,Temps,SP,ETAT,cindex,CR,ID,seuil_mortalite,seuil_coupe))
+
+#View(M_regen2)
+
+#Ici on verifie combien de ligne ont ete retirer parce qu'on as pige "Aucun" comme sp
+nbr_sans_regen<-nrow(M_regen)-nrow(M_regen2)
+
+#Placer des points random , en integrant les fenetre d'exclusion et celle d'inclusion
+
+regeneration<- runifpoint(gaule_ha, owin(poly=list(list(x=c(-1.8,68,55,-13), y=c(0,14,83,68)), list(x=as.vector(XRoutes_C),y=as.vector(YRoutes_C)), list(x=as.vector(XRoutes_C_2), y=as.vector(YRoutes_C_2)) )), warn=TRUE, nsim=1, drop=TRUE)     
+
+####Pour les tests on va plutôt runner parce qu'on as pas les limites encores
+# regeneration<- runifpoint(gaule_ha, owin(poly=list(list(x=c(-1.8,68,55,-13), y=c(0,14,83,68)))), warn=TRUE, nsim=1, drop=TRUE)
+
+#On as un probleme maintenant, regeneration er M_regen2 ne sont pas de la même longueur, 
+#on va regler ca en faisant un subset avec le ppp a la place
+
+
+#Convertir en PPP et enlever les "aucun"
+
+regeneration<-setmarks(regeneration, M_regen) #ici on remet le tout en ppp
+regeneration2<-subset.ppp(regeneration,SP!="Aucun",select = c(ID,DHP,DHP_mort,Temps,SP,ETAT,cindex,CR,seuil_mortalite,seuil_coupe))
+
+#Pas besoin d enlever le DHP au arbre mort dans les arbres anse pour éviter la compétition avant de les fusioner, c est deja fait manuellement
+#dans la table de donnee de base
+
+#Creer un vecteur qui contient la reponse a est-ce que l'arbre est mort
+
+#Ici on vient mettre notre base de donnee d'arbre Anse en PPP
+#Convertir le jeu de donnee en PPP 
+
+Marques_A_SQ<- data.frame(ID=ANSE_SQ$ID,DHP=ANSE_SQ$DHP,DHP_mort=ANSE_SQ$DHP_Mort,Temps="",SP=ANSE_SQ$SP,ETAT=ANSE_SQ$ETAT, cindex="", CR ="",seuil_mortalite="",seuil_coupe="") #spÃ©cifier quelles seront les marques
+ANSE_PPP<-ppp(ANSE_SQ$X, ANSE_SQ$Y, owin(poly=list(x=c(-1.8,68,55,-13), y=c(0,14,83,68))), marks=Marques_A_SQ) # les valeurs utilisÃ©es en X et Y dÃ©pendent du secteur (Anse ou dune)
+
+#et maintenant on rajoute la regeneration
+Anse_PPP_Regeneration<-superimpose(ANSE_PPP, regeneration2)
+
+
+
+
+
+########## Code de la boucle ##########
+
+#fixer à un au départ, mais quand on roule vraiment le programme c'est le deuxième
+
+#set.seed(1)
+
+##La boucle en temps que tel contient un compteur d'itération, le code pour generer les cindex, les codes pour calculer la competition
+###les codes pour retirer les arbres mort et les codes pour generer les fichier. Le premier fichier a deja ete netoyer des secteur sans 
+####regeneration ainsi que pour les mort. 
+
+for (r in 0:19) {
+  #r=0     #on fixe le i pour ne pas use la loop (bonne pratique de création de la loop) doit être commenter si on commence la boucle pour vrai facilite la visualisation des erreur à la ligne de code prêt
+  t=r*5
+  #print(t)  #ici on le commente parce qu'on as verifier que la fonction t fonctionnait
+  
+  ##Il faut maintenant attribuer des tolerances a la competition aux arbres
+  #Condition pour créer une nouvelle marks qui va donner les conditions de mortalite
+  sp_en_ordre<-c(Anse_PPP_Regeneration[["marks"]][["SP"]])
+  dhp_en_ordre<-c(Anse_PPP_Regeneration[["marks"]][["DHP"]])
+  seuil_mortalite<- c(rep(0,length(sp_en_ordre)))
+  seuil_coupe<- c(rep(0,length(sp_en_ordre)))
+  arret_boucle<-length(seuil_mortalite)
+  
+  #tres important de laisser j=1 avant la boucle while parce que sinon la boucle ne se ferait pas
+  j=0
+  
+  #Attribuer les seuil en fonction de sp
+  while (j<arret_boucle) { 
+    j=j+1
+    if(sp_en_ordre[j]=="PIB") { seuil_mortalite[j]=60 }
+    if(sp_en_ordre[j]=="CHR") { seuil_mortalite[j]=60 }
+    if(sp_en_ordre[j]=="CHB") { seuil_mortalite[j]=60 }
+    if(sp_en_ordre[j]=="ERR" & dhp_en_ordre[j]<10) { seuil_mortalite[j]=80 }
+    if(sp_en_ordre[j]=="ERR"& dhp_en_ordre[j]>=10) { seuil_mortalite[j]=60 }
+    if(sp_en_ordre[j]=="CET") { seuil_mortalite[j]=39 } 
+    if(sp_en_ordre[j]=="PEG") { seuil_mortalite[j]=39 } 
+    if(sp_en_ordre[j]=="BOP") { seuil_mortalite[j]=39 } 
+    if(sp_en_ordre[j]=="HEG") { seuil_mortalite[j]=88 } 
+    if(sp_en_ordre[j]=="OST") { seuil_mortalite[j]=88 } 
+    if(sp_en_ordre[j]=="ORA") { seuil_mortalite[j]=39 }
+    if(sp_en_ordre[j]=="TIA") { seuil_mortalite[j]=67 }
+    if(sp_en_ordre[j]=="ERS") { seuil_mortalite[j]=88 }
+    if(sp_en_ordre[j]=="CAC") { seuil_mortalite[j]=60 }
+    if(dhp_en_ordre[j]<5) { seuil_mortalite[j]=10000 } #ici on s'assure de pas tuer notre regeneration
+    
+  }
+  
+  
+  
+  v=0
+  
+  while (v<arret_boucle) { 
+    v=v+1
+    if(sp_en_ordre[v]=="PIB" & dhp_en_ordre[v]>15) { seuil_coupe[v]=39 }
+    if(sp_en_ordre[v]=="CHR" & dhp_en_ordre[v]>15) { seuil_coupe[v]=39 }
+    if(sp_en_ordre[v]=="CHB" & dhp_en_ordre[v]>15) { seuil_coupe[v]=39 }
+    if(sp_en_ordre[v]=="ERR" & dhp_en_ordre[v]>15) { seuil_coupe[v]=50 }
+    if(sp_en_ordre[v]=="CET" & dhp_en_ordre[v]>15) { seuil_coupe[v]=20 } 
+    if(sp_en_ordre[v]=="PEG" & dhp_en_ordre[v]>15) { seuil_coupe[v]=20 } 
+    if(sp_en_ordre[v]=="BOP" & dhp_en_ordre[v]>15) { seuil_coupe[v]=20 } 
+    if(sp_en_ordre[v]=="HEG" & dhp_en_ordre[v]>15) { seuil_coupe[v]=65 } 
+    if(sp_en_ordre[v]=="OST" & dhp_en_ordre[v]>15) { seuil_coupe[v]=65 } 
+    if(sp_en_ordre[v]=="ORA" & dhp_en_ordre[v]>15) { seuil_coupe[v]=20 }
+    if(sp_en_ordre[v]=="TIA" & dhp_en_ordre[v]>15) { seuil_coupe[v]=50 }
+    if(sp_en_ordre[v]=="ERS" & dhp_en_ordre[v]>15) { seuil_coupe[v]=65 }
+    if(sp_en_ordre[v]=="CAC" & dhp_en_ordre[v]>15) { seuil_coupe[v]=39 }
+    if(dhp_en_ordre[v]<=15) { seuil_coupe[v]=10000 } #ici on s'assure de pas tuer notre regeneration
+    
+    
+  }
+  
+  
+  #### effectuer un calcul de la competition ####
+  
+  Anse_PPP_reg_competition<- pairwise(Anse_PPP_Regeneration, maxR = 12, kernel = powers_ker, kerpar = list(pi=1, pj=1, pr=0, smark=2)) # attention ici smark dÃ©pend de oÃ¹ est placÃ© DHP dans la liste des marques. Si on a bien fait Ã§a il devrait Ãªtre en 2e. 
+  
+  #convertir en dataframe
+  Anse_regeneration_competition<-data.frame(Anse_PPP_reg_competition)
+  
+  #On veut y rajouter les autres indice calculer rendu ici
+  Anse_regeneration_competition$Temps=t
+  Anse_regeneration_competition$seuil_mortalite=seuil_mortalite
+  Anse_regeneration_competition$seuil_coupe=seuil_coupe
+  
+  #View(Anse_regeneration_competition)
+  
+  #calculer la croissance et le mettre dans le ppp et dans le dataframe
+  Anse_PPP_reg_competition$CR<- -0.899*log(Anse_regeneration_competition$cindex) + 4.0297
+  Anse_regeneration_competition$CR<- -0.899*log(Anse_regeneration_competition$cindex) + 4.0297
+  
+  
+  #Ici on veux imiter la réduction de croissance avec la taille de l'arbre. On va donc réduire graduellement la croissance des arbres de plus de 60 cm
+  #Attention les () ici sont hyper importante. Si vous jouer dans cette partie du code, ne perdez pas trace des ()
+  Anse_regeneration_competition[which(Anse_regeneration_competition$DHP>60),"CR"]=Anse_regeneration_competition[which(Anse_regeneration_competition$DHP>60),"CR"]*(1-((Anse_regeneration_competition[which(Anse_regeneration_competition$DHP>60),"DHP"]-60)/60))
+  
+  
+  Anse_regeneration_competition[is.na(Anse_regeneration_competition$cindex),"cindex"]=0
+  Anse_regeneration_competition[is.na(Anse_regeneration_competition$CR),"CR"]=0
+  Anse_regeneration_competition[which(Anse_regeneration_competition$CR<0),"CR"]=0 #Certaine croissance son negative, on ne veux pas ça. On va donc leur forcer une croissance de 0
+  
+  
+  #View(Anse_regeneration_competition)
+  
+  #Maintenant on peut faire croitre les arbres pendant 5 ans 
+  ##Pour ce faire on va creer une nouvelle colone dhp_fin
+  dhp_fin<-data.frame(matrix(0,length(Anse_regeneration_competition[,1]),1))
+  names(dhp_fin)<-"dhp_fin"
+  Anse_regeneration_competition<-cbind(Anse_regeneration_competition,dhp_fin)
+  
+  ##Maintenant le calcule!
+  # Calculer le nouveau DHP # pas sÃ»re. /10 pour en cm, *2 pour diametre, *5 pour 5 ans
+  
+  
+  Anse_regeneration_competition$dhp_fin<- Anse_regeneration_competition$DHP+(Anse_regeneration_competition$CR/10)*2*5 
+  
+  
+  #View(Anse_regeneration_competition)
+  
+  #Entron dans l'univers de la mortalité! chaque arbre a son propre seuil de mortalite qui lui est donnee dans la boucle
+  ##Comme on est en dataframe, c'est un peu plus facile, pas besoin de passer par 5 a 6 million de vecteur
+  
+  
+  ##Il faut commencer par retirer
+  i=0
+  while (i<arret_boucle) {
+    i=i+1
+    #on commence par mettre les gaules qui sont "immortelle" en dormance
+    if (Anse_regeneration_competition[i,10]==0 & Anse_regeneration_competition[i,4]<5){Anse_regeneration_competition[i,8]="Dormance"
+    }
+    #Ensuite on determine qui est mort et laisser sur place cet annee et on met le dhp_fin a 0. On doit prendre en 
+    ##compte le dhp fin pour determiner sil meurt debout ou est coupe
+    
+    if (Anse_regeneration_competition[i,9]>Anse_regeneration_competition[i,11] & Anse_regeneration_competition[i,14]<=20) { Anse_regeneration_competition[i,8]="M"
+    }
+    if (Anse_regeneration_competition[i,7]=="CHR" & Anse_regeneration_competition[i,14]>=70) { Anse_regeneration_competition[i,8]="M"
+    }
+    if (Anse_regeneration_competition[i,7]=="PIB" & Anse_regeneration_competition[i,14]>=80) { Anse_regeneration_competition[i,8]="M"
+    }
+    if(Anse_regeneration_competition[i,8]=="M" & Anse_regeneration_competition[i,4]>0) {Anse_regeneration_competition[i,5]=Anse_regeneration_competition[i,14]
+    }else(Anse_regeneration_competition[i,5]="") #on prend ici le dhp finale au cas ou il a reussi a croitre tout de meme cette annee
+    
+    #Remarquer le diametre limites des arbres 70 pour chr et 80 pour pib. On cherche ici a empecher l'imortaliter des plus gros et donc assume plus vieux arbres
+    
+    
+    #Ainsi on va attribuer le dhp mort au arbres qui ne sont pas deja mort (sinon dhp=0=dhp_mort, on veux prevenir ca)
+    ##Maintenant on enleve le dhp_fin des arbres qui sont mort durant cette periode pour pas qu'il competitionne la prochaine annee
+    
+    if(Anse_regeneration_competition[i,8]=="M" & Anse_regeneration_competition[i,4]>0) {Anse_regeneration_competition[i,14]=0
+    }
+    
+    #On a maintenant adequatement tuee nos petit arbres qui resteront sur place
+    
+    ##On veux maintenant couper ceux qui sont mal en point. si on ne veux pas faire de seuil differentiel, on peu modifier l equation d avant et commenter celle-ci
+    if (Anse_regeneration_competition[i,9]>Anse_regeneration_competition[i,12] & Anse_regeneration_competition[i,14]>20) { Anse_regeneration_competition[i,8]="coupe"
+    }
+    if(Anse_regeneration_competition[i,8]=="coupe" & Anse_regeneration_competition[i,14]>20) {Anse_regeneration_competition[i,5]=Anse_regeneration_competition[i,14]
+    }
+    
+    ##Maintenant on enleve le dhp_fin des arbres qui sont mort durant cette periode pour pas qu'il competitionne la prochaine annee
+    
+    if(Anse_regeneration_competition[i,8]=="coupe" & Anse_regeneration_competition[i,4]>0) {Anse_regeneration_competition[i,14]=0
+    }
+    
+  }
+  
+  #View(Anse_regeneration_competition)
+  
+  #Après avoir tuer nos arbres il faut sauvegarder la dataframe qu'on a creer
+  write.csv(Anse_regeneration_competition,file=paste("Foret",t,".csv",sep = ""))
+  
+  #Maintenant que le tout est sauvegardé on veux remplacer le premier tableau pour continuer la loop
+  ##*** Il faut faire attention, dans l'etat de cette formule, les arbre meurt a la fin de la periode 
+  ##*** donc il meurt et son comptabilise durant t. T0 contient donc les arbre mort a T0 et avant le debut de la simulation
+  
+  Anse_regeneration_competition<-Anse_regeneration_competition[which(Anse_regeneration_competition$ETAT!="M"),]
+  Anse_regeneration_competition<-Anse_regeneration_competition[which(Anse_regeneration_competition$ETAT!="coupe"),]
+  
+  
+  
+  Marques_A_SQ2<-Anse_regeneration_competition
+  Marques_A_SQ2$x=NULL
+  Marques_A_SQ2$y=NULL
+  Marques_A_SQ2$DHP<-Marques_A_SQ2$dhp_fin
+  Marques_A_SQ2$DHP_mort<- as.numeric( Marques_A_SQ2$DHP_mort)
+  Marques_A_SQ2$cindex.1=NULL
+  Marques_A_SQ2$dhp_fin=NULL
+  
+  
+  #Il faut faire un rm pour tuer le ANSE_PPP_Regeneration
+  rm("Anse_PPP_Regeneration")
+  
+  #Marques_A_SQ<- data.frame(ID=ANSE_SQ$ID,DHP=ANSE_SQ$DHP,DHP_mort=ANSE_SQ$DHP_Mort,Temps="",SP=ANSE_SQ$SP,ETAT=ANSE_SQ$ETAT, cindex="", CR ="",seuil_mortalite="",seuil_coupe="")
+  # Marques_A_SQ2<- data.frame(ID=Anse_regeneration_competition$ID,DHP=Anse_regeneration_competition$dhp_fin,DHP_mort=Anse_regeneration_competition$DHP_Mort,Temps=Anse_regeneration_competition$Temps,SP=Anse_regeneration_competition$SP,ETAT=Anse_regeneration_competition$ETAT, cindex="", CR ="",seuil_mortalite=0,seuil_coupe=0) #spÃ©cifier quelles seront les marques
+  Anse_PPP_Regeneration<-ppp(Anse_regeneration_competition$x, Anse_regeneration_competition$y, owin(poly=list(x=c(-1.8,68,55,-13), y=c(0,14,83,68))), marks=Marques_A_SQ2) # les valeurs utilisÃ©es en X et Y dÃ©pendent du secteur (Anse ou dune)
+  
+  
+  
+  
+  
+  
+  
+  
+  #On as maintenant retrouver le meme fichier de depart a l'exeption que DHP = dhp_fin maintenant, tout est pret a recommencer
+  
+  
+}
+
+###Nous somme rendu à l'ajout d'une colone suplementaire qui ajoute les seuils de mortalité 
+
+
+
+
+##Ici on va effectuer le ménages des données de depart
+# Ã cette etape, on peut retirer les arbres MORTS (on ne les veut pas en competition)
+
+
+
+####Statistique de fin
+print("nombre de semis retirer car regeneration deficiente (arbuste ou sans regeneration)")
+nbr_sans_regen
+
+
+#Mettre tous les fichiers ensemble il est important de rouler ce code apres le 
+#resultat plus haut et de changer le nom forestall entre chaque scenario tester
+#sinon on fait juste effacer le scenario precedent
+#Foret0 <- read_csv("Foret0.csv")
+#Foret5 <- read_csv("Foret5.csv")
+#Foret10 <- read_csv("Foret10.csv")
+#Foret15 <- read_csv("Foret15.csv")
+#Foret20 <- read_csv("Foret20.csv")
+#Foret25 <- read_csv("Foret25.csv")
+#Foret30 <- read_csv("Foret30.csv")
+#Foret35 <- read_csv("Foret35.csv")
+#Foret40 <- read_csv("Foret40.csv")
+#Foret45 <- read_csv("Foret45.csv")
+#Foret50 <- read_csv("Foret50.csv")
+#Foret55 <- read_csv("Foret55.csv")
+#Foret60 <- read_csv("Foret60.csv")
+#Foret65 <- read_csv("Foret65.csv")
+#Foret70 <- read_csv("Foret70.csv")
+#Foret75 <- read_csv("Foret75.csv")
+#Foret80 <- read_csv("Foret80.csv")
+#Foret85 <- read_csv("Foret85.csv")
+#Foret90 <- read_csv("Foret90.csv")
+#Foret95 <- read_csv("Foret95.csv")
+
+
+#Foretall<-rbind(Foret0,Foret5,Foret10,Foret15, Foret20,Foret25,Foret30,Foret35,Foret40,Foret45,Foret50,Foret55,Foret60,Foret65,Foret70,Foret75,Foret80,Foret85,Foret90,Foret95)
+
+#write.csv(Foretall,file=paste("Foretall.csv"))
